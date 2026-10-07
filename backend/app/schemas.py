@@ -3,12 +3,22 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class DatabaseHealth(BaseModel):
+    status: str = Field(..., description="Connection status: connected, disconnected, or not_configured")
+    configured: bool = Field(..., description="Whether DATABASE_URL is configured in environment")
+    message: str = Field(..., description="Descriptive status or error message")
+
+
 class HealthResponse(BaseModel):
     status: str = Field(..., example="healthy")
     version: str = Field(..., example="0.1.0")
     app_name: str = Field(..., example="Vayu AI")
-    phase: str = Field("Phase 1 Foundation", example="Phase 1 Foundation")
+    phase: str = Field("Phase 3 Foundation", example="Phase 3 Foundation")
     timestamp_utc: datetime
+    database: Optional[DatabaseHealth] = Field(
+        None,
+        description="Database connectivity status",
+    )
 
 
 class Station(BaseModel):

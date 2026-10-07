@@ -297,3 +297,50 @@ npm run build
 - **PostgreSQL (with PostGIS)** is the designated persistence layer for the next data-integration phase.
 - **SQLite is strictly prohibited** to prevent schema drift, ensure geospatial query parity (ST_DWithin, spatial indexing), and support production-grade time-series partitioning.
 
+---
+
+## 10. Official CPCB Air Quality Ingestion Pipeline (Phase 3 Step 3)
+
+### Primary Data Source
+- **Platform:** Open Government Data (OGD) Platform India ([data.gov.in](https://data.gov.in))
+- **Dataset:** *Real time Air Quality Index from various locations*
+- **Contributor:** Central Pollution Control Board (CPCB) / Ministry of Environment, Forest and Climate Change (MoEFCC)
+- **Official Resource ID:** `3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69`
+
+### Environment Configuration
+Register for a free account at [data.gov.in](https://data.gov.in), generate an API token, and add it to your `.env`:
+```ini
+DATA_GOV_IN_API_KEY=your_api_key_here
+DATA_GOV_IN_RESOURCE_ID=3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69
+```
+
+### Running Ingestion Locally
+Execute the manual ingestion runner from the repository root:
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m backend.app.scripts.ingest_aqi
+```
+Or from the `backend/` directory:
+```bash
+python -m app.scripts.ingest_aqi
+```
+
+Output:
+```text
+=== Vayu AI: CPCB AQI Data Ingestion ===
+Fetched records: X
+Normalized observations: Y
+Stations inserted/updated: Z
+Readings inserted: N
+Duplicates skipped: M
+========================================
+```
+
+### Ingestion Architecture & Data Integrity
+1. **Multi-Record Normalization:** data.gov.in publishes each pollutant measurement as a separate entry. The ingestion engine groups records by `(station, timestamp)` into a unified observation containing `pm2_5`, `pm10`, `no2`, `so2`, `co`, `o3`, and `aqi` where present.
+2. **Deterministic Station Matching:** Official station strings (e.g., `Anand Vihar, Delhi - DPCC`) are matched against Vayu AI's curated station directory (`anand-vihar`), preserving canonical station IDs and geospatial coordinates.
+3. **Idempotency & Duplicate Protection:** Enforces the database unique constraint `uq_station_reading_timestamp` on `(station_id, timestamp)` via PostgreSQL `ON CONFLICT DO NOTHING`. Running ingestion multiple times against identical observation timestamps produces zero duplicate rows.
+4. **Instrument Error Sanitization:** CPCB and OGD note that continuous real-time CAAQMS sensors occasionally transmit error codes (`-999`, `NA`, `null`). The parser converts invalid codes into null values and never converts missing readings into zeros.
+5. **Architectural Separation:** Live ground observations persist strictly in `air_quality_readings`. The 72-hour synthetic demo forecast remains separate and uncompromised for Phase 2 UI contracts.
+
+
