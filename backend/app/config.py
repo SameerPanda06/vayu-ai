@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     data_gov_in_base_url: str = "https://api.data.gov.in/resource"
     data_gov_in_timeout_seconds: float = 15.0
 
+    # Open-Meteo Development Fallback Configuration
+    open_meteo_base_url: str = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    open_meteo_timeout_seconds: float = 15.0
+    open_meteo_past_hours: int = 6
+    open_meteo_forecast_hours: int = 1
+
+    # Ingestion Orchestration Source Mode: "cpcb" (default), "open_meteo", or "auto"
+    aqi_ingestion_source: str = "cpcb"
+
     # Geographic filter scope: Delhi NCR
     delhi_ncr_states: List[str] = [
         "Delhi",

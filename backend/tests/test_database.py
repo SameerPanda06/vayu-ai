@@ -17,6 +17,7 @@ def test_models_metadata_registration():
     assert "stations" in table_names
     assert "air_quality_readings" in table_names
     assert "forecasts" in table_names
+    assert "modeled_air_quality_estimates" in table_names
 
 
 def test_station_model_schema():
@@ -117,6 +118,53 @@ def test_forecast_model_schema():
     assert fc.station_id == "anand-vihar"
     assert fc.predicted_pm2_5 == 145.2
     assert fc.model_version == "vayu-emulator-v0.1"
+
+
+def test_modeled_air_quality_estimate_model_schema():
+    """Verify ModeledAirQualityEstimate table schema, foreign keys, unique constraint, and indexes."""
+    from app.models import ModeledAirQualityEstimate
+
+    table = Base.metadata.tables["modeled_air_quality_estimates"]
+    column_names = {col.name for col in table.columns}
+    expected_cols = {
+        "id",
+        "station_id",
+        "valid_time",
+        "pm2_5",
+        "pm10",
+        "no2",
+        "so2",
+        "co",
+        "o3",
+        "provider",
+        "model_name",
+        "retrieved_at",
+    }
+    assert expected_cols.issubset(column_names)
+
+    # Foreign key check
+    fk_targets = {fk.target_fullname for fk in table.foreign_keys}
+    assert "stations.id" in fk_targets
+
+    # Model instantiation
+    now = datetime.now(timezone.utc)
+    estimate = ModeledAirQualityEstimate(
+        station_id="anand-vihar",
+        valid_time=now,
+        pm2_5=92.4,
+        pm10=210.0,
+        no2=25.4,
+        so2=30.1,
+        co=0.45,  # converted mg/m³
+        o3=65.0,
+        provider="open-meteo",
+        model_name="cams_europe",
+    )
+    assert estimate.station_id == "anand-vihar"
+    assert estimate.provider == "open-meteo"
+    assert estimate.co == 0.45
+    assert "anand-vihar" in repr(estimate)
+
 
 
 def test_database_url_normalization():

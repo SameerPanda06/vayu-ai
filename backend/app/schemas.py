@@ -68,3 +68,31 @@ class ForecastResponse(BaseModel):
     station: Station
     forecast_hours: int = Field(72, description="Total number of hourly steps returned")
     forecast: List[HourlyForecastRecord]
+
+
+class ModeledEstimateItem(BaseModel):
+    valid_time_utc: datetime = Field(..., description="Valid timestamp in UTC")
+    pm2_5: Optional[float] = Field(None, description="Modeled PM2.5 concentration in µg/m³")
+    pm10: Optional[float] = Field(None, description="Modeled PM10 concentration in µg/m³")
+    no2: Optional[float] = Field(None, description="Modeled NO2 concentration in µg/m³")
+    so2: Optional[float] = Field(None, description="Modeled SO2 concentration in µg/m³")
+    co: Optional[float] = Field(None, description="Modeled CO concentration in mg/m³")
+    o3: Optional[float] = Field(None, description="Modeled O3 concentration in µg/m³")
+    provider: str = Field("open-meteo", description="Model data provider")
+    model_name: Optional[str] = Field(None, description="Atmospheric model identifier")
+
+
+class ModeledEstimatesResponse(BaseModel):
+    station_id: str
+    data_type: Literal["modeled_estimate"] = "modeled_estimate"
+    provider: str = Field("open-meteo", description="Underlying estimate provider")
+    statement: str = Field(
+        default=(
+            "Atmospheric chemistry estimates derived from numerical models (Open-Meteo). "
+            "These are NOT official CPCB ground monitoring station observations."
+        ),
+        description="Data provenance disclosure",
+    )
+    count: int
+    estimates: List[ModeledEstimateItem]
+

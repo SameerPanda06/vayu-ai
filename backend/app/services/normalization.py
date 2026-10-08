@@ -245,3 +245,106 @@ def group_and_normalize_records(
                 obs.aqi = val
 
     return list(grouped.values())
+
+
+@dataclass
+class NormalizedModeledEstimate:
+    """
+    Normalized numerical atmospheric model estimate (e.g. Open-Meteo).
+    Maintains clean provenance separation from ground-truth CPCB observations.
+    """
+    station_id: str
+    valid_time: datetime  # UTC timezone-aware
+    pm2_5: Optional[float] = None
+    pm10: Optional[float] = None
+    no2: Optional[float] = None
+    so2: Optional[float] = None
+    co: Optional[float] = None  # Normalized to mg/m³
+    o3: Optional[float] = None
+    provider: str = "open-meteo"
+    model_name: Optional[str] = None
+
+
+def normalize_open_meteo_estimates(
+    station_id: str,
+    payload: Dict[str, Any],
+    provider: str = "open-meteo",
+    model_name: Optional[str] = None,
+) -> List[NormalizedModeledEstimate]:
+    """
+    Transform raw Open-Meteo Air Quality API response into structured NormalizedModeledEstimate records.
+
+    Key guarantees:
+    - Parses ISO timestamps explicitly as UTC.
+    - Converts Carbon Monoxide from Open-Meteo µg/m³ to standard schema mg/m³: CO_mg_m3 = CO_ug_m3 / 1000.
+    - Keeps PM2.5, PM10, NO2, SO2, and O3 in their documented µg/m³ units.
+    - Handles null values, missing array sentinels, and mismatched hourly array lengths safely.
+    - Never invents missing values or replaces them with zero.
+    - Never calculates or assigns an Indian CPCB AQI value.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, dict):
+        return []
+
+    times = hourly.get("time")
+    if not isinstance(times, list) or not times:
+        return []
+
+    pm2_5_arr = hourly.get("pm2_5")
+    pm10_arr = hourly.get("pm10")
+    no2_arr = hourly.get("nitrogen_dioxide")
+    so2_arr = hourly.get("sulphur_dioxide")
+    co_arr = hourly.get("carbon_monoxide")
+    o3_arr = hourly.get("ozone")
+
+    def _extract_val(arr: Any, index: int) -> Optional[float]:
+        if not isinstance(arr, list) or index >= len(arr):
+            return None
+        return parse_numeric(arr[index])
+
+    estimates: List[NormalizedModeledEstimate] = []
+
+    for idx, time_raw in enumerate(times):
+        if not time_raw:
+            continue
+
+        try:
+            time_str = str(time_raw).strip()
+            dt = datetime.fromisoformat(time_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+        pm2_5 = _extract_val(pm2_5_arr, idx)
+        pm10 = _extract_val(pm10_arr, idx)
+        no2 = _extract_val(no2_arr, idx)
+        so2 = _extract_val(so2_arr, idx)
+        o3 = _extract_val(o3_arr, idx)
+
+        # Carbon Monoxide: convert µg/m³ to mg/m³
+        co_raw_ug = _extract_val(co_arr, idx)
+        co_mg = (co_raw_ug / 1000.0) if co_raw_ug is not None else None
+
+        estimates.append(
+            NormalizedModeledEstimate(
+                station_id=station_id,
+                valid_time=dt,
+                pm2_5=pm2_5,
+                pm10=pm10,
+                no2=no2,
+                so2=so2,
+                co=co_mg,
+                o3=o3,
+                provider=provider,
+                model_name=model_name,
+            )
+        )
+
+    return estimates
+

@@ -1,19 +1,33 @@
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import httpx
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models import AirQualityReading
-from app.services.data_gov_client import DataGovClient
-from app.services.normalization import group_and_normalize_records
+from app.models import AirQualityReading, ModeledAirQualityEstimate
+from app.services.data_gov_client import (
+    DataGovAPIError,
+    DataGovAuthError,
+    DataGovClient,
+)
+from app.services.normalization import (
+    group_and_normalize_records,
+    normalize_open_meteo_estimates,
+)
+from app.services.open_meteo_client import (
+    OpenMeteoClient,
+    OpenMeteoError,
+)
 from app.services.station_matching import get_or_create_station
+from app.stations import get_all_stations
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class IngestionResult:
+    """Result summary for official CPCB ground observation ingestion."""
     fetched_records: int = 0
     normalized_observations: int = 0
     stations_upserted: int = 0
@@ -29,6 +43,59 @@ class IngestionResult:
             f"Readings inserted: {self.readings_inserted}\n"
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
+
+
+@dataclass
+class ModeledIngestionResult:
+    """Result summary for Open-Meteo numerical atmospheric estimates ingestion."""
+    records_fetched: int = 0
+    normalized_estimates: int = 0
+    stations_touched: int = 0
+    estimates_inserted: int = 0
+    duplicates_skipped: int = 0
+    provider: str = "open-meteo"
+    errors: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"Provider: {self.provider}\n"
+            f"Fetched records: {self.records_fetched}\n"
+            f"Normalized estimates: {self.normalized_estimates}\n"
+            f"Stations touched: {self.stations_touched}\n"
+            f"Estimates inserted: {self.estimates_inserted}\n"
+            f"Duplicates skipped: {self.duplicates_skipped}"
+        )
+
+
+@dataclass
+class OrchestratedIngestionResult:
+    """Result summary for multi-source ingestion orchestration."""
+    selected_mode: str  # "cpcb", "open_meteo", "auto"
+    actual_provider: str  # "cpcb" or "open-meteo"
+    records_fetched: int = 0
+    normalized_count: int = 0
+    stations_touched: int = 0
+    inserted_rows: int = 0
+    duplicates_skipped: int = 0
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
+    errors: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        lines = [
+            f"Selected source mode: {self.selected_mode}",
+            f"Actual provider used: {self.actual_provider}",
+            f"API records fetched: {self.records_fetched}",
+            f"Normalized observations or estimates: {self.normalized_count}",
+            f"Stations touched: {self.stations_touched}",
+            f"Inserted rows: {self.inserted_rows}",
+            f"Duplicates skipped: {self.duplicates_skipped}",
+        ]
+        if self.fallback_used:
+            lines.append(f"Fallback reason: {self.fallback_reason}")
+        if self.errors:
+            lines.append(f"Errors: {'; '.join(self.errors)}")
+        return "\n".join(lines)
 
 
 def ingest_air_quality_data(
@@ -140,4 +207,235 @@ def ingest_air_quality_data(
         db.rollback()
         logger.error(f"Error during AQI data ingestion: {exc}")
         result.errors.append(str(exc))
+        raise
+
+
+def ingest_open_meteo_data(
+    db: Session,
+    client: Optional[OpenMeteoClient] = None,
+    target_stations: Optional[List[Any]] = None,
+    past_hours: Optional[int] = None,
+    forecast_hours: Optional[int] = None,
+) -> ModeledIngestionResult:
+    """
+    Ingest numerical atmospheric model estimates from Open-Meteo for Delhi NCR stations.
+    Maintains strict separation: records are inserted into modeled_air_quality_estimates,
+    NEVER into air_quality_readings or forecasts.
+    Idempotent: uses uq_modeled_estimate_station_provider_time uniqueness constraint.
+    """
+    result = ModeledIngestionResult()
+    api_client = client or OpenMeteoClient()
+    stations = target_stations if target_stations is not None else get_all_stations()
+
+    if not stations:
+        return result
+
+    touched_station_ids = set()
+
+    try:
+        is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+
+        for station_meta in stations:
+            # Ensure the station exists in the stations catalog
+            db_station = get_or_create_station(
+                db=db,
+                raw_name=station_meta.name,
+                city=station_meta.city,
+                state=station_meta.state,
+                latitude=station_meta.latitude,
+                longitude=station_meta.longitude,
+            )
+            touched_station_ids.add(db_station.id)
+
+            # Fetch atmospheric estimates for station coordinates
+            raw_payload = api_client.fetch_air_quality(
+                latitude=station_meta.latitude,
+                longitude=station_meta.longitude,
+                past_hours=past_hours,
+                forecast_hours=forecast_hours,
+            )
+
+            hourly_times = raw_payload.get("hourly", {}).get("time", [])
+            result.records_fetched += len(hourly_times)
+
+            # Normalize estimates (including CO µg/m³ to mg/m³ conversion)
+            estimates = normalize_open_meteo_estimates(
+                station_id=db_station.id,
+                payload=raw_payload,
+                provider="open-meteo",
+            )
+            result.normalized_estimates += len(estimates)
+
+            for est in estimates:
+                if is_postgres:
+                    stmt = (
+                        pg_insert(ModeledAirQualityEstimate)
+                        .values(
+                            station_id=est.station_id,
+                            valid_time=est.valid_time,
+                            pm2_5=est.pm2_5,
+                            pm10=est.pm10,
+                            no2=est.no2,
+                            so2=est.so2,
+                            co=est.co,
+                            o3=est.o3,
+                            provider=est.provider,
+                            model_name=est.model_name,
+                        )
+                        .on_conflict_do_nothing(
+                            constraint="uq_modeled_estimate_station_provider_time"
+                        )
+                    )
+                    exec_res = db.execute(stmt)
+                    if exec_res.rowcount > 0:
+                        result.estimates_inserted += 1
+                    else:
+                        result.duplicates_skipped += 1
+                else:
+                    existing = (
+                        db.query(ModeledAirQualityEstimate.id)
+                        .filter(
+                            ModeledAirQualityEstimate.station_id == est.station_id,
+                            ModeledAirQualityEstimate.provider == est.provider,
+                            ModeledAirQualityEstimate.valid_time == est.valid_time,
+                        )
+                        .first()
+                    )
+                    if existing:
+                        result.duplicates_skipped += 1
+                    else:
+                        new_est = ModeledAirQualityEstimate(
+                            station_id=est.station_id,
+                            valid_time=est.valid_time,
+                            pm2_5=est.pm2_5,
+                            pm10=est.pm10,
+                            no2=est.no2,
+                            so2=est.so2,
+                            co=est.co,
+                            o3=est.o3,
+                            provider=est.provider,
+                            model_name=est.model_name,
+                        )
+                        db.add(new_est)
+                        result.estimates_inserted += 1
+
+        db.commit()
+        result.stations_touched = len(touched_station_ids)
+        return result
+
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Error during Open-Meteo modeled ingestion: {exc}")
+        result.errors.append(str(exc))
+        raise
+
+
+def orchestrate_aqi_ingestion(
+    db: Session,
+    mode: str = "auto",
+    cpcb_client: Optional[DataGovClient] = None,
+    open_meteo_client: Optional[OpenMeteoClient] = None,
+    cpcb_raw_records: Optional[List[Dict[str, Any]]] = None,
+    target_stations: Optional[List[Any]] = None,
+) -> OrchestratedIngestionResult:
+    """
+    Orchestrate air quality data ingestion across supported source modes:
+    - "cpcb": CPCB ingestion only. Failure raises without fallback.
+    - "open_meteo": Open-Meteo numerical estimates ingestion only.
+    - "auto": Attempt CPCB first; fallback to Open-Meteo ONLY on genuine network/upstream failures.
+      Does NOT fall back on missing/invalid credentials, invalid config, or coding errors.
+    """
+    mode_norm = (mode or "auto").strip().lower()
+    if mode_norm not in ("cpcb", "open_meteo", "auto"):
+        raise ValueError(
+            f"Invalid ingestion source mode '{mode}'. Choose from 'cpcb', 'open_meteo', or 'auto'."
+        )
+
+    if mode_norm == "open_meteo":
+        logger.info("Executing Open-Meteo ingestion only.")
+        om_res = ingest_open_meteo_data(
+            db=db,
+            client=open_meteo_client,
+            target_stations=target_stations,
+        )
+        return OrchestratedIngestionResult(
+            selected_mode="open_meteo",
+            actual_provider="open-meteo",
+            records_fetched=om_res.records_fetched,
+            normalized_count=om_res.normalized_estimates,
+            stations_touched=om_res.stations_touched,
+            inserted_rows=om_res.estimates_inserted,
+            duplicates_skipped=om_res.duplicates_skipped,
+            errors=om_res.errors,
+        )
+
+    if mode_norm == "cpcb":
+        logger.info("Executing CPCB ingestion only.")
+        cpcb_res = ingest_air_quality_data(
+            db=db,
+            client=cpcb_client,
+            raw_records=cpcb_raw_records,
+        )
+        return OrchestratedIngestionResult(
+            selected_mode="cpcb",
+            actual_provider="cpcb",
+            records_fetched=cpcb_res.fetched_records,
+            normalized_count=cpcb_res.normalized_observations,
+            stations_touched=cpcb_res.stations_upserted,
+            inserted_rows=cpcb_res.readings_inserted,
+            duplicates_skipped=cpcb_res.duplicates_skipped,
+            errors=cpcb_res.errors,
+        )
+
+    # mode_norm == "auto"
+    logger.info("Executing auto ingestion: attempting CPCB primary source first.")
+    try:
+        cpcb_res = ingest_air_quality_data(
+            db=db,
+            client=cpcb_client,
+            raw_records=cpcb_raw_records,
+        )
+        logger.info("Primary CPCB ingestion succeeded.")
+        return OrchestratedIngestionResult(
+            selected_mode="auto",
+            actual_provider="cpcb",
+            records_fetched=cpcb_res.fetched_records,
+            normalized_count=cpcb_res.normalized_observations,
+            stations_touched=cpcb_res.stations_upserted,
+            inserted_rows=cpcb_res.readings_inserted,
+            duplicates_skipped=cpcb_res.duplicates_skipped,
+            fallback_used=False,
+            errors=cpcb_res.errors,
+        )
+    except DataGovAuthError:
+        # Invalid credentials or missing API key: DO NOT silently fall back!
+        logger.error("CPCB authentication or configuration error; not falling back to Open-Meteo.")
+        raise
+    except (DataGovAPIError, httpx.ConnectError, httpx.NetworkError, httpx.TimeoutException) as exc:
+        # Genuine network failure, timeout, or upstream HTTP error: activate fallback
+        reason = str(exc)
+        logger.warning(
+            f"CPCB API primary source unreachable ({reason}). "
+            f"Activating Open-Meteo development fallback."
+        )
+        om_res = ingest_open_meteo_data(
+            db=db,
+            client=open_meteo_client,
+            target_stations=target_stations,
+        )
+        return OrchestratedIngestionResult(
+            selected_mode="auto",
+            actual_provider="open-meteo",
+            records_fetched=om_res.records_fetched,
+            normalized_count=om_res.normalized_estimates,
+            stations_touched=om_res.stations_touched,
+            inserted_rows=om_res.estimates_inserted,
+            duplicates_skipped=om_res.duplicates_skipped,
+            fallback_used=True,
+            fallback_reason=reason,
+            errors=om_res.errors,
+        )
+    except Exception as exc:
+        # Programming or database error: DO NOT fall back
+        logger.error(f"Unexpected error during CPCB ingestion: {exc}; not falling back.")
         raise

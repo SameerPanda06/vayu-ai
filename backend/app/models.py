@@ -75,6 +75,12 @@ class Station(Base):
         cascade="all, delete-orphan",
         order_by="desc(Forecast.forecast_time)",
     )
+    modeled_estimates: Mapped[List["ModeledAirQualityEstimate"]] = relationship(
+        "ModeledAirQualityEstimate",
+        back_populates="station",
+        cascade="all, delete-orphan",
+        order_by="desc(ModeledAirQualityEstimate.valid_time)",
+    )
 
     def __repr__(self) -> str:
         return f"<Station(id='{self.id}', name='{self.name}', city='{self.city}')>"
@@ -222,3 +228,98 @@ class Forecast(Base):
             f"<Forecast(station_id='{self.station_id}', forecast_time='{self.forecast_time}', "
             f"predicted_pm2_5={self.predicted_pm2_5}, model_version='{self.model_version}')>"
         )
+
+
+class ModeledAirQualityEstimate(Base):
+    """
+    Modeled and reanalysis atmospheric chemistry estimates (e.g. Open-Meteo).
+    Maintained strictly separate from ground station observations and official forecasts.
+    """
+    __tablename__ = "modeled_air_quality_estimates"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    station_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("stations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Associated monitoring station ID",
+    )
+    valid_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+        comment="Model valid step timestamp in UTC",
+    )
+    pm2_5: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated PM2.5 particulate mass concentration in µg/m³",
+    )
+    pm10: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated PM10 particulate mass concentration in µg/m³",
+    )
+    no2: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated Nitrogen Dioxide concentration in µg/m³",
+    )
+    so2: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated Sulfur Dioxide concentration in µg/m³",
+    )
+    co: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated Carbon Monoxide concentration in mg/m³",
+    )
+    o3: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Estimated Ozone concentration in µg/m³",
+    )
+    provider: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="open-meteo",
+        comment="Model data provider / upstream source identifier",
+    )
+    model_name: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="Underlying atmospheric model name (e.g., 'cams_europe')",
+    )
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="Record retrieval timestamp in UTC",
+    )
+
+    # Relationships
+    station: Mapped["Station"] = relationship(
+        "Station",
+        back_populates="modeled_estimates",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "station_id", "provider", "valid_time",
+            name="uq_modeled_estimate_station_provider_time",
+        ),
+        Index("ix_modeled_estimates_station_valid_time", "station_id", "valid_time"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ModeledAirQualityEstimate(station_id='{self.station_id}', "
+            f"provider='{self.provider}', valid_time='{self.valid_time}', pm2_5={self.pm2_5})>"
+        )
+

@@ -299,48 +299,100 @@ npm run build
 
 ---
 
-## 10. Official CPCB Air Quality Ingestion Pipeline (Phase 3 Step 3)
+---
 
-### Primary Data Source
-- **Platform:** Open Government Data (OGD) Platform India ([data.gov.in](https://data.gov.in))
-- **Dataset:** *Real time Air Quality Index from various locations*
-- **Contributor:** Central Pollution Control Board (CPCB) / Ministry of Environment, Forest and Climate Change (MoEFCC)
-- **Official Resource ID:** `3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69`
+## 10. Air Quality Ingestion & Open-Meteo Fallback (Phase 3 Steps 3 & 4)
 
-### Environment Configuration
-Register for a free account at [data.gov.in](https://data.gov.in), generate an API token, and add it to your `.env`:
+### 10.1 Data Sources & Provenance Architecture
+Vayu AI maintains a strict, uncompromised separation between ground-truth observations and numerical model estimates:
+
+| Source Type | Provider / Platform | Table | Primary Pollutants | Nature & Usage |
+| :--- | :--- | :--- | :--- | :--- |
+| **Primary Observation** | CPCB / MoEFCC via [data.gov.in](https://data.gov.in) | `air_quality_readings` | PM2.5, PM10, NO2, SO2, CO, O3, CPCB AQI | Official physical ground monitoring observations from continuous CAAQMS stations. Ground truth. |
+| **Development Fallback** | [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api) | `modeled_air_quality_estimates` | PM2.5, PM10, NO2, SO2, CO, O3 | Numerical reanalysis / atmospheric chemistry model outputs. Non-ground-truth development surrogate. |
+| **Synthetic Demo Forecast** | Vayu AI Synthetic Physics Model | `forecasts` (Phase 1/2 UI contract) | PM2.5, T, Wind, PBL | Illustrative deterministic 72h series for interface validation. |
+
+> [!WARNING]
+> **Data Provenance Guarantee:** Modeled atmospheric estimates from Open-Meteo are **never** inserted into `air_quality_readings` or mixed with official CPCB observations. Modeled values are **never** labeled as official measurements, and an Indian CPCB AQI is **never** calculated from modeled estimates.
+
+### 10.2 Environment Configuration
+Configure your `.env` for ingestion orchestration:
 ```ini
+# Air Quality Ingestion Source Mode ('cpcb', 'open_meteo', or 'auto')
+AQI_INGESTION_SOURCE=auto
+
+# Primary Data Source: Official Data.gov.in CPCB Real-time Air Quality API
 DATA_GOV_IN_API_KEY=your_api_key_here
 DATA_GOV_IN_RESOURCE_ID=3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69
+DATA_GOV_IN_BASE_URL=https://api.data.gov.in/resource
+DATA_GOV_IN_TIMEOUT_SECONDS=15.0
+
+# Development Fallback: Open-Meteo Air Quality API (Zero cost, no key required)
+OPEN_METEO_BASE_URL=https://air-quality-api.open-meteo.com/v1/air-quality
+OPEN_METEO_TIMEOUT_SECONDS=15.0
+OPEN_METEO_PAST_HOURS=6
+OPEN_METEO_FORECAST_HOURS=1
 ```
 
-### Running Ingestion Locally
-Execute the manual ingestion runner from the repository root:
+### 10.3 Database Migrations
+Vayu AI uses additive, non-destructive SQL migrations to manage table schemas:
 ```powershell
-.\.venv\Scripts\Activate.ps1
-python -m backend.app.scripts.ingest_aqi
+# From repository root:
+.\.venv\Scripts\python -m backend.app.scripts.migrate
+
+# Or from backend/ directory:
+python -m app.scripts.migrate
 ```
-Or from the `backend/` directory:
-```bash
-python -m app.scripts.ingest_aqi
+This safely creates the `modeled_air_quality_estimates` table and its composite uniqueness constraint `uq_modeled_estimate_station_provider_time` without dropping or modifying existing tables.
+
+### 10.4 Running Ingestion via CLI
+Execute ingestion in any of the three supported source modes:
+
+#### 1. Automatic Fallback Ingestion (Recommended for Development)
+Tries official CPCB first; on genuine network failures (e.g. `api.data.gov.in` connection refusals, timeouts, or 5xx outages), automatically falls back to Open-Meteo:
+```powershell
+python -m backend.app.scripts.ingest_aqi --source auto
 ```
 
-Output:
+#### 2. Open-Meteo Only Ingestion
+Directly queries Open-Meteo atmospheric chemistry estimates for all Delhi NCR stations (requires zero external API keys):
+```powershell
+python -m backend.app.scripts.ingest_aqi --source open_meteo
+```
+
+#### 3. CPCB Only Ingestion
+Strictly queries official CPCB data from `data.gov.in` (fails with clear error if upstream host is unreachable; will not fall back):
+```powershell
+python -m backend.app.scripts.ingest_aqi --source cpcb
+```
+
+Sample Output (Automatic Fallback):
 ```text
-=== Vayu AI: CPCB AQI Data Ingestion ===
-Fetched records: X
-Normalized observations: Y
-Stations inserted/updated: Z
-Readings inserted: N
-Duplicates skipped: M
-========================================
+CPCB API primary source unreachable (Connection failure communicating with data.gov.in: [WinError 10061] No connection could be made because the target machine actively refused it). Activating Open-Meteo development fallback.
+=== Vayu AI: Air Quality Data Ingestion ===
+Selected source mode: auto
+Actual provider used: open-meteo
+API records fetched: 42
+Normalized observations or estimates: 42
+Stations touched: 6
+Inserted rows: 42
+Duplicates skipped: 0
+Fallback notice: CPCB primary unavailable; fell back to Open-Meteo.
+==========================================
 ```
 
-### Ingestion Architecture & Data Integrity
-1. **Multi-Record Normalization:** data.gov.in publishes each pollutant measurement as a separate entry. The ingestion engine groups records by `(station, timestamp)` into a unified observation containing `pm2_5`, `pm10`, `no2`, `so2`, `co`, `o3`, and `aqi` where present.
-2. **Deterministic Station Matching:** Official station strings (e.g., `Anand Vihar, Delhi - DPCC`) are matched against Vayu AI's curated station directory (`anand-vihar`), preserving canonical station IDs and geospatial coordinates.
-3. **Idempotency & Duplicate Protection:** Enforces the database unique constraint `uq_station_reading_timestamp` on `(station_id, timestamp)` via PostgreSQL `ON CONFLICT DO NOTHING`. Running ingestion multiple times against identical observation timestamps produces zero duplicate rows.
-4. **Instrument Error Sanitization:** CPCB and OGD note that continuous real-time CAAQMS sensors occasionally transmit error codes (`-999`, `NA`, `null`). The parser converts invalid codes into null values and never converts missing readings into zeros.
-5. **Architectural Separation:** Live ground observations persist strictly in `air_quality_readings`. The 72-hour synthetic demo forecast remains separate and uncompromised for Phase 2 UI contracts.
+### 10.5 Unit Normalization & Timestamp Standards
+1. **Carbon Monoxide (CO) Unit Conversion:** Open-Meteo provides CO concentrations in $\mu\text{g/m}^3$. The internal schema standardizes CO to $\text{mg/m}^3$ to align with Indian National Ambient Air Quality Standards (NAAQS). During normalization:
+   $$\text{CO}_{\text{mg/m}^3} = \frac{\text{CO}_{\mu\text{g/m}^3}}{1000}$$
+2. **UTC Timestamps:** All timestamps from Open-Meteo are parsed explicitly as timezone-aware UTC datetime objects.
+3. **Missing Value Sanitization:** Nulls, sentinels (`-999`, `NA`), or empty entries are parsed as `None` and never converted to zeros.
+4. **Idempotency:** Re-running ingestion for the same station and valid timestamp creates 0 duplicates thanks to PostgreSQL `ON CONFLICT DO NOTHING`.
+
+### 10.6 Scientific Limitations of Modeled Estimates
+- **Grid Resolution vs Microscale Sensors:** Open-Meteo provides modeled chemical transport forecasts (derived from ECMWF Copernicus CAMS and atmospheric reanalysis) on a regional grid (~10–25 km). Ground CAAQMS stations measure localized, microscale street-canyon and emission-source air.
+- **Topography and Local Sources:** Biomass burning, local trash fires, and vehicle idling at intersections (e.g. Anand Vihar bus terminal) cause localized ground concentration spikes not captured by regional gridded models.
+- **Zero-Cost Budget Compliance:** Open-Meteo's Air Quality API is free for non-commercial open-source research and development, adhering strictly to the ₹0 project budget.
+- **Attribution:** Data provided by [Open-Meteo](https://open-meteo.com/) under Creative Commons Attribution 4.0 International (CC BY 4.0), utilizing data from Copernicus Atmosphere Monitoring Service (CAMS).
+
 
 
