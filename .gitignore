@@ -60,3 +60,12 @@ frontend/dist-ssr/
 *~
 .DS_Store
 Thumbs.db
+
+# Machine Learning Artifacts & Models
+artifacts/
+backend/artifacts/
+*.joblib
+*.pkl
+*.parquet
+*.dump
+

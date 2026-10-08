@@ -15,7 +15,7 @@ def get_health() -> HealthResponse:
         status="healthy",
         version=settings.app_version,
         app_name=settings.app_name,
-        phase="Phase 3 Foundation",
+        phase="Phase 4 ML Baselines",
         timestamp_utc=datetime.now(timezone.utc),
         database=DatabaseHealth(**db_status),
     )

@@ -39,6 +39,6 @@ app.include_router(forecast.router, prefix="/api")
 def root():
     return {
         "app": settings.app_name,
-        "phase": "Phase 1 Foundation",
+        "phase": "Phase 4 ML Baselines",
         "notice": "Visit /api/health or /docs for API documentation.",
     }

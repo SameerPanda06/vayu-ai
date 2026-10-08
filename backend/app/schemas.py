@@ -13,7 +13,7 @@ class HealthResponse(BaseModel):
     status: str = Field(..., example="healthy")
     version: str = Field(..., example="0.1.0")
     app_name: str = Field(..., example="Vayu AI")
-    phase: str = Field("Phase 3 Foundation", example="Phase 3 Foundation")
+    phase: str = Field("Phase 4 ML Baselines", example="Phase 4 ML Baselines")
     timestamp_utc: datetime
     database: Optional[DatabaseHealth] = Field(
         None,
@@ -95,4 +95,60 @@ class ModeledEstimatesResponse(BaseModel):
     )
     count: int
     estimates: List[ModeledEstimateItem]
+
+
+class ExperimentalHorizonForecast(BaseModel):
+    horizon_hours: int = Field(..., description="Forecast horizon in hours: 24, 48, or 72")
+    horizon_label: str = Field(..., description="Display label (e.g. '+24h')")
+    target_time_utc: datetime = Field(..., description="Target validity timestamp in UTC")
+    predicted_pm2_5: float = Field(..., ge=0.0, description="Predicted PM2.5 concentration in µg/m³ (nonnegative)")
+    selected_model: str = Field(..., description="Model chosen on validation partition (e.g. 'ridge', 'persistence', 'seasonal_aligned')")
+    model_type: str = Field(..., description="Descriptive model architecture and hyperparameters")
+    artifact_id: Optional[str] = Field(None, description="Model artifact identifier")
+    validation_mae: Optional[float] = Field(None, description="Mean Absolute Error on validation partition during baseline evaluation")
+
+
+class ExperimentalForecastResponse(BaseModel):
+    status: Literal["experimental"] = "experimental"
+    is_experimental: bool = Field(True, description="Designates output as unvalidated experimental baseline research")
+    station_id: str = Field(..., description="Identifier of the Delhi NCR monitoring station")
+    station_name: str = Field(..., description="Human-readable station name")
+    prediction_time_utc: datetime = Field(..., description="Point-in-time reference anchor timestamp t_0 in UTC")
+    target_pollutant: str = Field("pm2_5", description="Target pollutant forecasted")
+    units: str = Field("µg/m³", description="Concentration units")
+    forecast_structure: str = Field(
+        default="discrete_milestones_24h_48h_72h",
+        description="Forecast horizon structure: predicts discrete +24h, +48h, and +72h horizons, not a full 72-point hourly sequence.",
+    )
+    hourly_sequence_note: str = Field(
+        default=(
+            "Baseline models predict 3 discrete horizons (+24h, +48h, +72h). "
+            "A full 72-step hourly series requires direct 72-head multi-output models or recursive neural autoregression."
+        ),
+        description="Requirement note for continuous 72-step hourly forecasts",
+    )
+    data_provider: str = Field(
+        default="Open-Meteo (Copernicus CAMS atmospheric composition)",
+        description="Atmospheric data provider",
+    )
+    data_product: str = Field(
+        default="CAMS Global Operational Forecast (live inference) & CAMS Global Reanalysis (training)",
+        description="Underlying atmospheric modeling products and provenance",
+    )
+    training_period: dict = Field(
+        default_factory=lambda: {
+            "start_utc": "2024-10-01T00:00:00Z",
+            "end_utc": "2024-12-29T23:00:00Z",
+        },
+        description="Historical training date range in UTC",
+    )
+    disclaimer: str = Field(
+        default=(
+            "Experimental ML baseline forecast derived from Open-Meteo Copernicus CAMS "
+            "atmospheric models. These are NOT official CPCB ground observations "
+            "and do NOT replace operational forecasts."
+        ),
+        description="Scientific provenance and experimental disclaimer",
+    )
+    horizons: List[ExperimentalHorizonForecast] = Field(..., description="Forecasts for +24h, +48h, and +72h")
 

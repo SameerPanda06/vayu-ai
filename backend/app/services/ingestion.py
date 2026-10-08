@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -210,12 +211,37 @@ def ingest_air_quality_data(
         raise
 
 
+def _truncate_to_hour(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def get_latest_completed_hourly_timestamp(ref: Optional[datetime] = None) -> datetime:
+    """
+    Compute the start timestamp of the latest completed hourly interval.
+
+    In Open-Meteo, hourly timestamps denote the beginning of the interval [t, t+1h).
+    An interval is only completed when reference time >= t + 1 hour.
+    Therefore, the latest completed interval start timestamp is:
+        truncate_to_hour(ref_utc) - 1 hour.
+    """
+    if ref is None:
+        ref = datetime.now(timezone.utc)
+    return _truncate_to_hour(ref) - timedelta(hours=1)
+
+
 def ingest_open_meteo_data(
     db: Session,
     client: Optional[OpenMeteoClient] = None,
     target_stations: Optional[List[Any]] = None,
     past_hours: Optional[int] = None,
     forecast_hours: Optional[int] = None,
+    max_timestamp: Optional[datetime] = None,
+    exclude_future: bool = True,
+    completed_only: bool = True,
 ) -> ModeledIngestionResult:
     """
     Ingest numerical atmospheric model estimates from Open-Meteo for Delhi NCR stations.
@@ -264,6 +290,15 @@ def ingest_open_meteo_data(
                 payload=raw_payload,
                 provider="open-meteo",
             )
+            if exclude_future:
+                if max_timestamp is not None:
+                    effective_cutoff = max_timestamp
+                elif completed_only:
+                    effective_cutoff = get_latest_completed_hourly_timestamp(datetime.now(timezone.utc))
+                else:
+                    effective_cutoff = _truncate_to_hour(datetime.now(timezone.utc))
+                estimates = [e for e in estimates if e.valid_time <= effective_cutoff]
+
             result.normalized_estimates += len(estimates)
 
             for est in estimates:
@@ -439,3 +474,184 @@ def orchestrate_aqi_ingestion(
         # Programming or database error: DO NOT fall back
         logger.error(f"Unexpected error during CPCB ingestion: {exc}; not falling back.")
         raise
+
+
+@dataclass
+class HistoricalIngestionResult:
+    """Result summary for historical numerical atmospheric estimates ingestion."""
+    start_date: str
+    end_date: str
+    records_fetched: int = 0
+    normalized_estimates: int = 0
+    stations_touched: int = 0
+    estimates_inserted: int = 0
+    duplicates_skipped: int = 0
+    provider: str = "open-meteo"
+    station_breakdown: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        lines = [
+            f"Provider: {self.provider}",
+            f"Date range: {self.start_date} to {self.end_date}",
+            f"Stations processed: {self.stations_touched}",
+            f"Total API records fetched: {self.records_fetched}",
+            f"Normalized estimates: {self.normalized_estimates}",
+            f"Estimates inserted: {self.estimates_inserted}",
+            f"Duplicates skipped: {self.duplicates_skipped}",
+        ]
+        if self.errors:
+            lines.append(f"Errors: {'; '.join(self.errors)}")
+        return "\n".join(lines)
+
+
+def ingest_historical_open_meteo_data(
+    db: Session,
+    start_date: str,
+    end_date: str,
+    client: Optional[OpenMeteoClient] = None,
+    target_stations: Optional[List[Any]] = None,
+    max_timestamp: Optional[datetime] = None,
+    exclude_future: bool = True,
+    completed_only: bool = True,
+) -> HistoricalIngestionResult:
+    """
+    Ingest historical hourly modeled air quality estimates from Open-Meteo for a date window [start_date, end_date].
+    Maintains strict provenance separation: all data persists in modeled_air_quality_estimates.
+    Idempotent: uses uq_modeled_estimate_station_provider_time constraint.
+    """
+    from app.services.open_meteo_client import parse_date_string
+
+    start_d = parse_date_string(start_date)
+    end_d = parse_date_string(end_date)
+    if end_d < start_d:
+        raise ValueError(f"end_date ({end_date}) cannot be earlier than start_date ({start_date})")
+
+    result = HistoricalIngestionResult(start_date=start_date, end_date=end_date)
+    api_client = client or OpenMeteoClient()
+    stations = target_stations if target_stations is not None else get_all_stations()
+
+    if not stations:
+        return result
+
+    touched_station_ids = set()
+
+    try:
+        is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+
+        for station_meta in stations:
+            db_station = get_or_create_station(
+                db=db,
+                raw_name=station_meta.name,
+                city=station_meta.city,
+                state=station_meta.state,
+                latitude=station_meta.latitude,
+                longitude=station_meta.longitude,
+            )
+            touched_station_ids.add(db_station.id)
+
+            raw_payload = api_client.fetch_historical_air_quality(
+                latitude=station_meta.latitude,
+                longitude=station_meta.longitude,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            hourly_times = raw_payload.get("hourly", {}).get("time", [])
+            fetched_count = len(hourly_times)
+            result.records_fetched += fetched_count
+
+            estimates = normalize_open_meteo_estimates(
+                station_id=db_station.id,
+                payload=raw_payload,
+                provider="open-meteo",
+            )
+            if exclude_future:
+                if max_timestamp is not None:
+                    effective_cutoff = max_timestamp
+                elif completed_only:
+                    effective_cutoff = get_latest_completed_hourly_timestamp(datetime.now(timezone.utc))
+                else:
+                    effective_cutoff = _truncate_to_hour(datetime.now(timezone.utc))
+                estimates = [e for e in estimates if e.valid_time <= effective_cutoff]
+
+            norm_count = len(estimates)
+            result.normalized_estimates += norm_count
+
+            inserted_for_station = 0
+            skipped_for_station = 0
+
+            for est in estimates:
+                if is_postgres:
+                    stmt = (
+                        pg_insert(ModeledAirQualityEstimate)
+                        .values(
+                            station_id=est.station_id,
+                            valid_time=est.valid_time,
+                            pm2_5=est.pm2_5,
+                            pm10=est.pm10,
+                            no2=est.no2,
+                            so2=est.so2,
+                            co=est.co,
+                            o3=est.o3,
+                            provider=est.provider,
+                            model_name=est.model_name,
+                        )
+                        .on_conflict_do_nothing(
+                            constraint="uq_modeled_estimate_station_provider_time"
+                        )
+                    )
+                    exec_res = db.execute(stmt)
+                    if exec_res.rowcount > 0:
+                        inserted_for_station += 1
+                        result.estimates_inserted += 1
+                    else:
+                        skipped_for_station += 1
+                        result.duplicates_skipped += 1
+                else:
+                    existing = (
+                        db.query(ModeledAirQualityEstimate.id)
+                        .filter(
+                            ModeledAirQualityEstimate.station_id == est.station_id,
+                            ModeledAirQualityEstimate.provider == est.provider,
+                            ModeledAirQualityEstimate.valid_time == est.valid_time,
+                        )
+                        .first()
+                    )
+                    if existing:
+                        skipped_for_station += 1
+                        result.duplicates_skipped += 1
+                    else:
+                        new_est = ModeledAirQualityEstimate(
+                            station_id=est.station_id,
+                            valid_time=est.valid_time,
+                            pm2_5=est.pm2_5,
+                            pm10=est.pm10,
+                            no2=est.no2,
+                            so2=est.so2,
+                            co=est.co,
+                            o3=est.o3,
+                            provider=est.provider,
+                            model_name=est.model_name,
+                        )
+                        db.add(new_est)
+                        inserted_for_station += 1
+                        result.estimates_inserted += 1
+
+            result.station_breakdown[db_station.id] = {
+                "fetched": fetched_count,
+                "normalized": norm_count,
+                "inserted": inserted_for_station,
+                "skipped": skipped_for_station,
+            }
+
+        db.commit()
+        result.stations_touched = len(touched_station_ids)
+        return result
+
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Error during historical Open-Meteo ingestion: {exc}")
+        result.errors.append(str(exc))
+        raise
+
